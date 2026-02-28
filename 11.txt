@@ -1,0 +1,28 @@
+import bpy
+import numpy as np
+
+# 获取当前场景的相机
+cam = bpy.context.scene.camera.data
+
+# 获取渲染分辨率（像素单位）
+render = bpy.context.scene.render
+width = render.resolution_x
+height = render.resolution_y
+
+# 获取传感器宽度（毫米）和焦距（毫米）
+sensor_width = cam.sensor_width  # 单位：mm
+focal_length = cam.lens          # 单位：mm
+
+# 计算以像素为单位的焦距fx (fy通常等于fx，除非像素宽高比不为1)
+# 公式：f_pixel = focal_length * width / sensor_width
+f_x = focal_length * width / sensor_width
+f_y = f_x * render.pixel_aspect_x / render.pixel_aspect_y
+
+# 获取主点偏移（如果未设置，默认为图像中心）
+# 注意：cam.shift_x 和 cam.shift_y 是归一化偏移量
+shift_x = cam.shift_x * width
+shift_y = cam.shift_y * height
+c_x = width / 2 + shift_x
+c_y = height / 2 + shift_y
+
+print(f"内参矩阵 K = [[{f_x:.2f}, 0, {c_x:.2f}], [0, {f_y:.2f}, {c_y:.2f}], [0, 0, 1]]")
