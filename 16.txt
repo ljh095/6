@@ -1,0 +1,329 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import torch
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle, Circle
+from PIL import Image, ImageTk
+from transformers import SamModel, SamProcessor
+import warnings
+warnings.filterwarnings('ignore')
+
+class SAMApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("SAM3 交互式分割工具")
+        self.root.geometry("900x700")
+
+        # 模型相关
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = None
+        self.processor = None
+        self.load_model()
+
+        # 图像数据
+        self.image = None          # numpy array (H,W,3) RGB
+        self.original_size = None  # (H,W)
+        self.fig = None
+        self.ax = None
+        self.canvas = None
+
+        # 提示数据
+        self.fg_points = []        # 前景点 [(x,y), ...]
+        self.bg_points = []        # 背景点
+        self.box = None            # (x1,y1,x2,y2) 或 None
+        self.current_mode = "point"  # "point" 或 "box"
+        self.drawing_box = False    # 是否正在画框
+        self.box_start = None       # 画框起点
+        self.box_preview = None     # 预览矩形对象
+
+        # 覆盖层
+        self.mask_overlay = None    # imshow 对象
+        self.point_scatter = None   # 点绘制
+        self.box_patch = None       # 框绘制
+
+        # 创建界面
+        self.create_widgets()
+
+    def load_model(self):
+        """加载 SAM 模型和处理器"""
+        try:
+            self.status_var.set("正在加载模型（首次下载约2GB）...")
+            self.root.update()
+            model_name = "facebook/sam-vit-base"
+            self.processor = SamProcessor.from_pretrained(model_name)
+            self.model = SamModel.from_pretrained(model_name).to(self.device)
+            self.model.eval()
+            self.status_var.set("模型加载完成，设备: " + str(self.device))
+        except Exception as e:
+            messagebox.showerror("模型加载失败", str(e))
+            self.status_var.set("模型加载失败")
+
+    def create_widgets(self):
+        # 顶部工具栏
+        toolbar = tk.Frame(self.root)
+        toolbar.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        btn_load = tk.Button(toolbar, text="加载图像", command=self.load_image)
+        btn_load.pack(side=tk.LEFT, padx=2)
+
+        self.mode_var = tk.StringVar(value="point")
+        rb_point = tk.Radiobutton(toolbar, text="点模式", variable=self.mode_var,
+                                  value="point", command=self.switch_mode)
+        rb_point.pack(side=tk.LEFT, padx=2)
+        rb_box = tk.Radiobutton(toolbar, text="框模式", variable=self.mode_var,
+                                value="box", command=self.switch_mode)
+        rb_box.pack(side=tk.LEFT, padx=2)
+
+        btn_clear_points = tk.Button(toolbar, text="清除点", command=self.clear_points)
+        btn_clear_points.pack(side=tk.LEFT, padx=2)
+        btn_clear_box = tk.Button(toolbar, text="清除框", command=self.clear_box)
+        btn_clear_box.pack(side=tk.LEFT, padx=2)
+        btn_segment = tk.Button(toolbar, text="分割", command=self.segment, bg="lightblue")
+        btn_segment.pack(side=tk.LEFT, padx=2)
+        btn_clear_all = tk.Button(toolbar, text="清除所有", command=self.clear_all)
+        btn_clear_all.pack(side=tk.LEFT, padx=2)
+
+        # 状态栏
+        self.status_var = tk.StringVar(value="就绪")
+        status_bar = tk.Label(self.root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Matplotlib 图像区域
+        self.fig = Figure(figsize=(8, 6), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("请先加载图像")
+        self.ax.axis('off')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # 添加 matplotlib 默认工具栏（可选）
+        toolbar_nav = NavigationToolbar2Tk(self.canvas, self.root)
+        toolbar_nav.update()
+        toolbar_nav.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # 绑定鼠标事件
+        self.canvas.mpl_connect('button_press_event', self.on_mouse_press)
+        self.canvas.mpl_connect('button_release_event', self.on_mouse_release)
+        self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
+
+    def load_image(self):
+        """打开图像文件并显示"""
+        file_path = filedialog.askopenfilename(
+            filetypes=[("图像文件", "*.jpg *.jpeg *.png *.bmp *.tiff")]
+        )
+        if not file_path:
+            return
+        try:
+            pil_image = Image.open(file_path).convert("RGB")
+            self.image = np.array(pil_image)
+            self.original_size = self.image.shape[:2]  # (H,W)
+            self.ax.clear()
+            self.ax.imshow(self.image)
+            self.ax.set_title("图像 - 左键前景点/画框，右键背景点")
+            self.ax.axis('off')
+            self.canvas.draw()
+            self.clear_all()  # 重置提示
+            self.status_var.set(f"图像已加载: {file_path} ({self.original_size[1]}x{self.original_size[0]})")
+        except Exception as e:
+            messagebox.showerror("加载失败", str(e))
+
+    def switch_mode(self):
+        """切换点/框模式"""
+        self.current_mode = self.mode_var.get()
+        self.status_var.set(f"当前模式: {'点模式' if self.current_mode=='point' else '框模式'}")
+
+    def clear_points(self):
+        """清除所有点"""
+        self.fg_points.clear()
+        self.bg_points.clear()
+        self.redraw_overlays()
+        self.status_var.set("点已清除")
+
+    def clear_box(self):
+        """清除当前框"""
+        self.box = None
+        self.redraw_overlays()
+        self.status_var.set("框已清除")
+
+    def clear_all(self):
+        """清除所有提示和掩码"""
+        self.clear_points()
+        self.clear_box()
+        self.remove_mask()
+
+    def remove_mask(self):
+        if self.mask_overlay:
+            self.mask_overlay.remove()
+            self.mask_overlay = None
+        self.canvas.draw()
+
+    def on_mouse_press(self, event):
+        if event.inaxes != self.ax or self.image is None:
+            return
+        x, y = int(event.xdata), int(event.ydata)  # 像素坐标
+        if self.current_mode == "point":
+            if event.button == 1:  # 左键前景
+                self.fg_points.append((x, y))
+                self.status_var.set(f"添加前景点 ({x}, {y})")
+            elif event.button == 3:  # 右键背景
+                self.bg_points.append((x, y))
+                self.status_var.set(f"添加背景点 ({x}, {y})")
+            self.redraw_overlays()
+        elif self.current_mode == "box":
+            if event.button == 1:  # 左键开始画框
+                self.drawing_box = True
+                self.box_start = (x, y)
+                # 如果已有框，先清除预览
+                if self.box_preview:
+                    self.box_preview.remove()
+                    self.box_preview = None
+                # 创建预览矩形（初始为起点）
+                self.box_preview = Rectangle((x, y), 0, 0, linewidth=2, edgecolor='yellow', facecolor='none')
+                self.ax.add_patch(self.box_preview)
+                self.canvas.draw()
+
+    def on_mouse_move(self, event):
+        if not self.drawing_box or event.inaxes != self.ax:
+            return
+        x, y = int(event.xdata), int(event.ydata)
+        x0, y0 = self.box_start
+        # 更新预览矩形
+        width = x - x0
+        height = y - y0
+        self.box_preview.set_width(width)
+        self.box_preview.set_height(height)
+        self.box_preview.set_xy((x0, y0))
+        self.canvas.draw()
+
+    def on_mouse_release(self, event):
+        if not self.drawing_box or event.button != 1:
+            return
+        if event.inaxes != self.ax:
+            # 如果释放时不在图像内，取消画框
+            self.drawing_box = False
+            if self.box_preview:
+                self.box_preview.remove()
+                self.box_preview = None
+            self.canvas.draw()
+            return
+        x1, y1 = self.box_start
+        x2, y2 = int(event.xdata), int(event.ydata)
+        # 确保左上右下顺序
+        x1, x2 = sorted([x1, x2])
+        y1, y2 = sorted([y1, y2])
+        self.box = (x1, y1, x2, y2)
+        self.drawing_box = False
+        # 删除预览，绘制最终框
+        if self.box_preview:
+            self.box_preview.remove()
+            self.box_preview = None
+        self.redraw_overlays()
+        self.status_var.set(f"框已设置: ({x1},{y1}) -> ({x2},{y2})")
+
+    def redraw_overlays(self):
+        """重绘所有点、框和掩码（不重新运行模型）"""
+        if self.ax is None or self.image is None:
+            return
+        # 清除之前的覆盖层（保留图像）
+        for artist in self.ax.lines + self.ax.patches + self.ax.collections:
+            if artist != self.mask_overlay and artist != self.box_patch:
+                artist.remove()
+        self.ax.images = [self.ax.images[0]] if self.ax.images else []  # 只保留原始图像
+
+        # 绘制前景点（绿色）
+        if self.fg_points:
+            xs, ys = zip(*self.fg_points)
+            self.ax.scatter(xs, ys, c='green', marker='o', s=50, edgecolors='white', zorder=5)
+        # 绘制背景点（红色）
+        if self.bg_points:
+            xs, ys = zip(*self.bg_points)
+            self.ax.scatter(xs, ys, c='red', marker='x', s=50, linewidths=2, zorder=5)
+
+        # 绘制框
+        if self.box:
+            x1, y1, x2, y2 = self.box
+            self.box_patch = Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='blue', facecolor='none')
+            self.ax.add_patch(self.box_patch)
+
+        self.canvas.draw()
+
+    def segment(self):
+        """调用 SAM 模型进行分割"""
+        if self.image is None:
+            messagebox.showwarning("警告", "请先加载图像")
+            return
+        if not self.fg_points and not self.bg_points and self.box is None:
+            messagebox.showwarning("警告", "请至少添加一个点或一个框")
+            return
+
+        if self.model is None or self.processor is None:
+            messagebox.showerror("错误", "模型未加载成功")
+            return
+
+        try:
+            self.status_var.set("正在分割...")
+            self.root.update()
+
+            # 准备输入
+            image_pil = Image.fromarray(self.image)
+            # 根据当前模式构造提示
+            input_points = None
+            input_labels = None
+            input_boxes = None
+
+            if self.current_mode == "point" and (self.fg_points or self.bg_points):
+                # 合并前景背景点
+                points = self.fg_points + self.bg_points
+                labels = [1] * len(self.fg_points) + [0] * len(self.bg_points)
+                # 转换为模型需要的形状 (batch, num_prompts, num_points, 2)
+                input_points = [[points]]  # 一组提示，包含多个点
+                input_labels = [[labels]]
+            elif self.current_mode == "box" and self.box is not None:
+                input_boxes = [[self.box]]
+            else:
+                messagebox.showwarning("警告", f"当前模式下没有有效的提示")
+                return
+
+            # 使用 processor 准备输入
+            inputs = self.processor(
+                images=image_pil,
+                input_points=input_points,
+                input_boxes=input_boxes,
+                return_tensors="pt"
+            ).to(self.device)
+
+            # 预测
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+
+            # 后处理得到原始尺寸的 mask
+            masks = self.processor.post_process_masks(
+                outputs.pred_masks.cpu(),
+                inputs["original_sizes"].cpu(),
+                inputs["reshaped_input_sizes"].cpu()
+            )
+            # masks 是列表，每个元素对应一个batch，每个batch有num_prompts个mask
+            # 这里我们取第一个batch的第一个prompt的第一个mask（如果有多候选，取分数最高的）
+            pred_mask = masks[0][0].numpy()  # (H,W) bool
+
+            # 显示掩码（半透明红色）
+            self.remove_mask()
+            # 创建彩色掩码覆盖
+            colored_mask = np.zeros((*pred_mask.shape, 4), dtype=np.float32)
+            colored_mask[pred_mask] = [1, 0, 0, 0.5]  # 红色半透明
+            self.mask_overlay = self.ax.imshow(colored_mask, alpha=0.5, zorder=3)
+            self.canvas.draw()
+
+            self.status_var.set("分割完成")
+        except Exception as e:
+            messagebox.showerror("分割失败", str(e))
+            self.status_var.set("分割出错")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SAMApp(root)
+    root.mainloop()
