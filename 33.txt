@@ -1,0 +1,378 @@
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+from fastapi import FastAPI, Response, HTTPException, Query
+from fastapi.responses import StreamingResponse
+import threading
+import time
+import base64
+import io
+from contextlib import asynccontextmanager
+from pydantic import BaseModel
+from abc import ABC, abstractmethod
+from typing import Optional, Tuple
+
+# ---------------------------
+# 相机抽象基类
+# ---------------------------
+class CameraBase(ABC):
+    """所有相机的抽象基类"""
+    def __init__(self, width: int = 640, height: int = 480, fps: int = 30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+
+    @abstractmethod
+    def start(self):
+        """启动相机采集线程"""
+        pass
+
+    @abstractmethod
+    def stop(self):
+        """停止相机并释放资源"""
+        pass
+
+    @abstractmethod
+    def get_rgb(self) -> Optional[np.ndarray]:
+        """获取最新 RGB 图像 (BGR 格式)"""
+        pass
+
+    @abstractmethod
+    def get_depth(self) -> Optional[np.ndarray]:
+        """获取最新深度图 (16位, 单位毫米)，若无则返回 None"""
+        pass
+
+    @abstractmethod
+    def get_frames(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """同时获取 RGB 和深度"""
+        pass
+
+# ---------------------------
+# RealSense 相机实现
+# ---------------------------
+class RealSenseCamera(CameraBase):
+    def __init__(self, width: int = 640, height: int = 480, fps: int = 30):
+        super().__init__(width, height, fps)
+        self.running = False
+        self.thread = None
+        self.lock = threading.Lock()
+        self.latest_rgb = None
+        self.latest_depth = None
+        self.pipeline = None
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+        if self.pipeline:
+            self.pipeline.stop()
+            self.pipeline = None
+
+    def _capture_loop(self):
+        # 配置管道
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+        config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+        self.pipeline.start(config)
+
+        align = rs.align(rs.stream.color)
+
+        try:
+            while self.running:
+                frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+                aligned = align.process(frames)
+                depth_frame = aligned.get_depth_frame()
+                color_frame = aligned.get_color_frame()
+                if not depth_frame or not color_frame:
+                    continue
+
+                depth_image = np.asanyarray(depth_frame.get_data())
+                color_image = np.asanyarray(color_frame.get_data())
+
+                with self.lock:
+                    self.latest_depth = depth_image
+                    self.latest_rgb = color_image
+        finally:
+            if self.pipeline:
+                self.pipeline.stop()
+                self.pipeline = None
+
+    def get_rgb(self):
+        with self.lock:
+            return self.latest_rgb.copy() if self.latest_rgb is not None else None
+
+    def get_depth(self):
+        with self.lock:
+            return self.latest_depth.copy() if self.latest_depth is not None else None
+
+    def get_frames(self):
+        with self.lock:
+            rgb = self.latest_rgb.copy() if self.latest_rgb is not None else None
+            depth = self.latest_depth.copy() if self.latest_depth is not None else None
+            return rgb, depth
+
+# ---------------------------
+# USB 普通摄像头实现（仅 RGB）
+# ---------------------------
+class USBCamera(CameraBase):
+    def __init__(self, device_id: int = 0, width: int = 640, height: int = 480, fps: int = 30):
+        super().__init__(width, height, fps)
+        self.device_id = device_id
+        self.running = False
+        self.thread = None
+        self.lock = threading.Lock()
+        self.latest_rgb = None
+        self.cap = None
+
+    def start(self):
+        if self.running:
+            return
+        self.cap = cv2.VideoCapture(self.device_id)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+    def _capture_loop(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    self.latest_rgb = frame  # BGR
+
+    def get_rgb(self):
+        with self.lock:
+            return self.latest_rgb.copy() if self.latest_rgb is not None else None
+
+    def get_depth(self):
+        return None
+
+    def get_frames(self):
+        rgb = self.get_rgb()
+        return rgb, None
+
+# ---------------------------
+# 相机管理器
+# ---------------------------
+class CameraManager:
+    def __init__(self):
+        self._cameras = {}          # key: camera_type, value: camera instance
+        self._lock = threading.Lock()
+
+    def _create_camera(self, camera_type: str, **kwargs) -> CameraBase:
+        """工厂方法：根据类型创建相机实例（不启动）"""
+        if camera_type == "realsense":
+            return RealSenseCamera(**kwargs)
+        elif camera_type == "usb":
+            return USBCamera(**kwargs)
+        else:
+            raise ValueError(f"不支持的相机类型: {camera_type}")
+
+    def configure_camera(self, camera_type: str, **kwargs) -> CameraBase:
+        """
+        配置指定类型的相机。
+        如果该类型相机已存在，则先停止并删除，然后用新参数创建并启动。
+        返回新创建的相机实例。
+        """
+        with self._lock:
+            # 如果已存在，先停止并移除
+            if camera_type in self._cameras:
+                old_cam = self._cameras.pop(camera_type)
+                old_cam.stop()
+
+            # 创建新相机
+            camera = self._create_camera(camera_type, **kwargs)
+            camera.start()
+            self._cameras[camera_type] = camera
+            return camera
+
+    def get_camera(self, camera_type: str) -> CameraBase:
+        """获取指定类型的相机实例（必须已配置）"""
+        with self._lock:
+            if camera_type not in self._cameras:
+                raise KeyError(f"相机 {camera_type} 未配置，请先调用 /camera/configure")
+            return self._cameras[camera_type]
+
+    def get_camera_config(self, camera_type: str) -> dict:
+        """获取指定类型相机的当前配置"""
+        cam = self.get_camera(camera_type)
+        return {
+            "camera_type": camera_type,
+            "width": cam.width,
+            "height": cam.height,
+            "fps": cam.fps
+        }
+
+    def shutdown_all(self):
+        """停止所有相机（应用退出时调用）"""
+        with self._lock:
+            for cam in self._cameras.values():
+                cam.stop()
+            self._cameras.clear()
+
+# 全局相机管理器实例
+camera_manager = CameraManager()
+
+# ---------------------------
+# FastAPI 应用
+# ---------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时无需操作
+    yield
+    # 关闭时释放所有相机
+    camera_manager.shutdown_all()
+
+app = FastAPI(lifespan=lifespan)
+
+# 请求模型
+class CameraConfigRequest(BaseModel):
+    camera_type: str = "realsense"
+    width: int = 640
+    height: int = 480
+    fps: int = 30
+    device_id: Optional[int] = 0  # USB 摄像头专用
+
+@app.post("/camera/configure")
+async def configure_camera(config: CameraConfigRequest):
+    """
+    配置相机。如果该类型相机已存在，则用新参数重新创建。
+    返回当前配置。
+    """
+    try:
+        # 构建参数（过滤掉 None）
+        kwargs = config.dict(exclude_unset=True)
+        camera_type = kwargs.pop("camera_type")
+        # 对于 realsense，device_id 不适用，可以忽略或保留（RealSense 初始化时不使用）
+        if camera_type == "realsense" and "device_id" in kwargs:
+            del kwargs["device_id"]
+        camera = camera_manager.configure_camera(camera_type, **kwargs)
+        return {
+            "message": "相机配置成功",
+            "config": {
+                "camera_type": camera_type,
+                "width": camera.width,
+                "height": camera.height,
+                "fps": camera.fps
+            }
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"相机启动失败: {str(e)}")
+
+@app.get("/camera/config")
+async def get_camera_config(camera_type: str = Query(..., description="相机类型")):
+    """获取当前已配置相机的参数"""
+    try:
+        config = camera_manager.get_camera_config(camera_type)
+        return config
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/rgb")
+async def get_rgb(camera_type: str = Query(..., description="相机类型")):
+    """获取单张 RGB 图像 (JPEG)"""
+    try:
+        cam = camera_manager.get_camera(camera_type)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    rgb = cam.get_rgb()
+    if rgb is None:
+        raise HTTPException(status_code=503, detail="相机尚未准备好")
+
+    _, jpeg = cv2.imencode('.jpg', rgb)
+    return Response(content=jpeg.tobytes(), media_type="image/jpeg")
+
+@app.get("/depth")
+async def get_depth(camera_type: str = Query(..., description="相机类型")):
+    """获取深度图 (PNG, 16位)，仅支持有深度能力的相机"""
+    try:
+        cam = camera_manager.get_camera(camera_type)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    depth = cam.get_depth()
+    if depth is None:
+        raise HTTPException(status_code=404, detail="该相机不支持深度图")
+
+    _, png = cv2.imencode('.png', depth)
+    return Response(content=png.tobytes(), media_type="image/png")
+
+@app.get("/data")
+async def get_data(camera_type: str = Query(..., description="相机类型")):
+    """返回 JSON，包含 RGB 和深度（Base64 编码）"""
+    try:
+        cam = camera_manager.get_camera(camera_type)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    rgb, depth = cam.get_frames()
+    if rgb is None:
+        raise HTTPException(status_code=503, detail="相机尚未准备好")
+
+    # 编码 RGB
+    _, rgb_jpeg = cv2.imencode('.jpg', rgb)
+    rgb_base64 = base64.b64encode(rgb_jpeg.tobytes()).decode()
+
+    result = {"rgb": rgb_base64}
+    if depth is not None:
+        _, depth_png = cv2.imencode('.png', depth)
+        depth_base64 = base64.b64encode(depth_png.tobytes()).decode()
+        result["depth"] = depth_base64
+
+    return result
+
+@app.get("/video_feed")
+async def video_feed(camera_type: str = Query(..., description="相机类型")):
+    """MJPEG 视频流（RGB 图像）"""
+    try:
+        cam = camera_manager.get_camera(camera_type)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    def generate():
+        while True:
+            rgb = cam.get_rgb()
+            if rgb is None:
+                # 未准备好时返回黑屏（也可选择等待）
+                frame = np.zeros((cam.height, cam.width, 3), dtype=np.uint8)
+            else:
+                frame = rgb
+            _, jpeg = cv2.imencode('.jpg', frame)
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+            time.sleep(1/30)  # 限制帧率
+
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+@app.get("/cameras")
+async def list_cameras():
+    """返回支持的相机类型列表"""
+    return {"supported_cameras": ["realsense", "usb"]}
+
+# ---------------------------
+# 启动入口
+# ---------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
