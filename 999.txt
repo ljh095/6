@@ -1,0 +1,105 @@
+import requests
+import json
+import base64
+import cv2
+import numpy as np
+from pathlib import Path
+
+def call_foundationpose_service(
+    rgb_path: str,
+    depth_path: str,
+    mask_path: str,
+    cad_path: str,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    service_url: str = "http://localhost:8000/estimate_pose",
+    return_visualization: bool = True,
+    save_vis_path: str = None
+):
+    """
+    调用 FoundationPose 位姿估计服务
+
+    参数:
+        rgb_path: RGB图像文件路径
+        depth_path: 深度图文件路径（建议16-bit PNG或EXR，单位米）
+        mask_path: 二值mask图像文件路径
+        cad_path: CAD模型文件路径（支持obj/stl/ply）
+        fx, fy, cx, cy: 相机内参（像素）
+        service_url: 服务端点URL
+        return_visualization: 是否请求可视化结果图
+        save_vis_path: 如果提供，将可视化图像保存到此路径（如 'vis.jpg'）
+
+    返回:
+        dict: 包含旋转矩阵、平移向量以及可选可视化base64的响应
+    """
+    # 准备文件上传字典
+    files = {
+        'rgb': ('rgb.png', open(rgb_path, 'rb'), 'image/png'),
+        'depth': ('depth.png', open(depth_path, 'rb'), 'image/png'),   # 根据实际格式修改MIME
+        'mask': ('mask.png', open(mask_path, 'rb'), 'image/png'),
+        'cad': (Path(cad_path).name, open(cad_path, 'rb'), 'application/octet-stream'),
+    }
+
+    # 准备表单数据（内参）
+    data = {
+        'fx': str(fx),
+        'fy': str(fy),
+        'cx': str(cx),
+        'cy': str(cy),
+        'return_visualization': str(return_visualization).lower()  # 注意FastAPI期望布尔值，但作为表单字段会解析为字符串，服务端需正确转换
+    }
+
+    try:
+        # 发送POST请求
+        response = requests.post(service_url, files=files, data=data, timeout=30)
+        response.raise_for_status()  # 检查HTTP错误
+
+        # 解析JSON响应
+        result = response.json()
+        print("位姿估计成功！")
+        print("旋转矩阵 (3x3):")
+        for row in result['rotation_matrix']:
+            print(row)
+        print("平移向量:", result['translation_vector'])
+
+        # 如果返回了可视化图像并请求保存
+        if return_visualization and result.get('visualization') and save_vis_path:
+            # base64解码并保存
+            img_data = base64.b64decode(result['visualization'])
+            nparr = np.frombuffer(img_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            cv2.imwrite(save_vis_path, img)
+            print(f"可视化图像已保存至: {save_vis_path}")
+
+        return result
+
+    except requests.exceptions.RequestException as e:
+        print(f"请求失败: {e}")
+        if response is not None:
+            print("服务器响应:", response.text)
+        raise
+    finally:
+        # 确保所有文件被关闭
+        for f in files.values():
+            f[1].close()
+
+
+if __name__ == "__main__":
+    # 示例用法
+    # 请将以下路径替换为实际文件路径
+    result = call_foundationpose_service(
+        rgb_path="path/to/rgb.jpg",
+        depth_path="path/to/depth.png",
+        mask_path="path/to/mask.png",
+        cad_path="path/to/model.obj",
+        fx=500.0,
+        fy=500.0,
+        cx=320.0,
+        cy=240.0,
+        service_url="http://localhost:8000/estimate_pose",
+        return_visualization=True,
+        save_vis_path="output_vis.jpg"
+    )
+    # 可选：进一步处理 result 中的位姿数据
