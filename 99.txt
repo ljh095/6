@@ -1,0 +1,174 @@
+import os
+import tempfile
+import base64
+import numpy as np
+import cv2
+import torch
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.responses import JSONResponse
+from typing import Optional
+import uvicorn
+
+# 假设 FoundationPose 已经安装并且可以从其模块导入
+# 如果没有安装，请参考官方文档安装：https://github.com/NVlabs/FoundationPose
+try:
+    from foundationpose import FoundationPose  # 实际导入方式根据官方实现调整
+    from foundationpose.utils import estimate_pose  # 假设有一个简洁的估计函数
+except ImportError:
+    raise ImportError(
+        "FoundationPose 未安装或无法导入。请参考官方仓库安装："
+        "https://github.com/NVlabs/FoundationPose"
+    )
+
+app = FastAPI(title="FoundationPose 位姿估计服务")
+
+# 全局变量，用于加载一次模型
+model = None
+
+@app.on_event("startup")
+async def load_model():
+    """
+    应用启动时加载 FoundationPose 模型。
+    假设模型需要预训练权重文件，这里需要根据实际情况指定路径。
+    """
+    global model
+    # 根据 FoundationPose 的实现，可能需要传入配置和权重
+    # 这里示例使用默认配置
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = FoundationPose(mode='refine', device=device)  # 参数仅为示例
+    print("FoundationPose 模型加载完成。")
+
+def parse_image_file(file: UploadFile, flag=cv2.IMREAD_COLOR) -> np.ndarray:
+    """
+    将上传的文件转换为 OpenCV 图像数组。
+    """
+    contents = file.file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, flag)
+    if img is None:
+        raise HTTPException(status_code=400, detail=f"无法解析图像文件: {file.filename}")
+    return img
+
+def parse_depth_file(file: UploadFile) -> np.ndarray:
+    """
+    解析深度图文件。假设深度图以 16-bit PNG 或 EXR 格式存储，转换为 float32 数组（单位：米）。
+    用户需根据实际情况调整。
+    """
+    contents = file.file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    depth = cv2.imdecode(nparr, cv2.IMREAD_ANYDEPTH)  # 读取为原始深度
+    if depth is None:
+        raise HTTPException(status_code=400, detail=f"无法解析深度图文件: {file.filename}")
+    # 如果深度图是16位PNG，通常需要除以缩放因子（例如1000）转换为米
+    # 这里假设深度已经以米为单位存储（例如 EXR），或用户上传时已处理好
+    return depth.astype(np.float32)
+
+def parse_mask_file(file: UploadFile) -> np.ndarray:
+    """
+    解析 Mask 图文件。通常为单通道二值图像。
+    """
+    mask = parse_image_file(file, cv2.IMREAD_GRAYSCALE)
+    # 确保 mask 为二值（0 或 255）
+    _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    return mask
+
+@app.post("/estimate_pose")
+async def estimate_pose(
+    rgb: UploadFile = File(..., description="RGB图像 (jpg/png)"),
+    depth: UploadFile = File(..., description="深度图 (png/exr)"),
+    mask: UploadFile = File(..., description="物体Mask (png, 二值)"),
+    cad: UploadFile = File(..., description="CAD模型文件 (obj/stl/ply)"),
+    fx: float = Form(..., description="相机内参 fx (像素)"),
+    fy: float = Form(..., description="相机内参 fy (像素)"),
+    cx: float = Form(..., description="相机内参 cx (像素)"),
+    cy: float = Form(..., description="相机内参 cy (像素)"),
+    return_visualization: bool = Form(True, description="是否返回可视化结果图（base64编码）")
+):
+    """
+    接收 RGB、深度图、Mask 和 CAD 模型，调用 FoundationPose 进行 6D 位姿估计。
+    返回位姿数据（旋转矩阵、平移向量）以及可选的可视化图像。
+    """
+    global model
+    if model is None:
+        raise HTTPException(status_code=500, detail="模型未加载，请稍后重试。")
+
+    # 1. 解析上传的文件
+    try:
+        rgb_img = parse_image_file(rgb, cv2.IMREAD_COLOR)
+        depth_img = parse_depth_file(depth)
+        mask_img = parse_mask_file(mask)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"文件解析失败: {str(e)}")
+
+    # 2. 保存 CAD 文件到临时文件（FoundationPose 可能需要文件路径或网格对象）
+    #    如果 FoundationPose 支持直接传入文件对象，可以避免磁盘写入
+    cad_suffix = os.path.splitext(cad.filename)[1].lower()
+    if cad_suffix not in ['.obj', '.stl', '.ply']:
+        raise HTTPException(status_code=400, detail=f"不支持的CAD格式: {cad_suffix}，支持 obj/stl/ply")
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=cad_suffix) as tmp_cad:
+        tmp_cad.write(await cad.read())
+        tmp_cad_path = tmp_cad.name
+
+    try:
+        # 3. 构建相机内参矩阵 K
+        K = np.array([[fx, 0, cx],
+                      [0, fy, cy],
+                      [0,  0,  1]], dtype=np.float32)
+
+        # 4. 调用 FoundationPose 进行位姿估计
+        #    根据 FoundationPose 的实际 API 调整调用方式
+        #    这里假设有一个 `estimate_pose` 函数，返回旋转矩阵和平移向量
+        #    如果模型是类实例，可能需要调用 model.run() 等方法
+        pose_rot, pose_trans = estimate_pose(
+            model=model,
+            rgb=rgb_img,
+            depth=depth_img,
+            mask=mask_img,
+            cad_path=tmp_cad_path,
+            K=K,
+            # 可能还需要其他参数，如是否进行迭代优化等
+        )
+        # 如果返回的是 4x4 齐次矩阵，可以分解
+        # pose_matrix = estimate_pose(...)  # shape (4,4)
+        # pose_rot = pose_matrix[:3, :3]
+        # pose_trans = pose_matrix[:3, 3]
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"位姿估计失败: {str(e)}")
+    finally:
+        # 清理临时 CAD 文件
+        if os.path.exists(tmp_cad_path):
+            os.unlink(tmp_cad_path)
+
+    # 5. 构建响应
+    response = {
+        "rotation_matrix": pose_rot.tolist(),
+        "translation_vector": pose_trans.tolist(),
+        # 也可以输出欧拉角或四元数，根据需要添加
+    }
+
+    # 6. 可选：生成可视化结果图（在 RGB 上绘制估计的物体轮廓或坐标系）
+    if return_visualization:
+        try:
+            # 这里需要根据 FoundationPose 提供的渲染工具绘制
+            # 假设有一个函数 `render_pose` 可以将 CAD 模型以当前位姿投影到图像上
+            from foundationpose.visualization import draw_pose_on_image  # 虚构函数
+            vis_img = draw_pose_on_image(rgb_img, pose_rot, pose_trans, cad_path=tmp_cad_path, K=K)
+            # 编码为 base64
+            _, buffer = cv2.imencode('.jpg', vis_img)
+            vis_base64 = base64.b64encode(buffer).decode('utf-8')
+            response["visualization"] = vis_base64
+        except Exception as e:
+            # 可视化失败不影响主结果，仅记录警告
+            print(f"可视化生成失败: {e}")
+            response["visualization"] = None
+
+    return JSONResponse(content=response)
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
