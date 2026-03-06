@@ -1,0 +1,42 @@
+import numpy as np
+
+def normalize(x, lower, upper):
+    """
+    将真实参数值 x 归一化到 [0, 1] 区间。
+
+    参数:
+        x : 单个数值或 np.ndarray，待归一化的参数值
+        lower : 标量或数组，参数的下界
+        upper : 标量或数组，参数的上界
+
+    返回:
+        x_norm : 与 x 同形状的归一化值
+    """
+    # 避免除零：若上下限相等，则所有值归一化为 0.5 或直接返回 0？这里设定为 0（可根据需要调整）
+    range_ = upper - lower
+    if np.isscalar(range_):
+        if range_ == 0:
+            return np.zeros_like(x) if isinstance(x, np.ndarray) else 0.0
+    else:
+        range_ = np.where(range_ == 0, 1.0, range_)  # 临时替换为1避免除零，后面再特殊处理
+    x_norm = (x - lower) / range_
+    # 处理由于浮点误差导致的轻微越界（裁剪到 [0,1]）
+    x_norm = np.clip(x_norm, 0, 1)
+    return x_norm
+
+def denormalize(x_norm, lower, upper):
+    """
+    将归一化值 [0, 1] 映射回真实参数空间。
+
+    参数:
+        x_norm : 单个数值或 np.ndarray，归一化值
+        lower : 标量或数组，参数的下界
+        upper : 标量或数组，参数的上界
+
+    返回:
+        x : 真实参数值
+    """
+    range_ = upper - lower
+    x = x_norm * range_ + lower
+    return x
+    
