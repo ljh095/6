@@ -1,0 +1,28 @@
+import pyrealsense2 as rs
+
+# 创建并启动 pipeline（只需获取信息，可以只配置流，不一定要启）
+pipeline = rs.pipeline()
+config = rs.config()
+# 启用左红外流，分辨率可以按需设置，这里用 1280x720 为例
+config.enable_stream(rs.stream.infrared, 1, 1280, 720, rs.format.y8, 30)
+profile = pipeline.start(config)
+
+# 获取左红外流（stream type: infrared, index: 1）的 profile
+infrared_profile = profile.get_stream(rs.stream.infrared, 1)
+
+# 关键步骤：获取内参
+# 将 profile 转换为视频流 profile，然后获取 intrinsics
+intrinsics = infrared_profile.as_video_stream_profile().get_intrinsics()
+
+# 打印内参
+print("左红外相机内参:")
+print(f"  宽度 (Width): {intrinsics.width}")
+print(f"  高度 (Height): {intrinsics.height}")
+print(f"  主点 (PPX, PPY): ({intrinsics.ppx:.3f}, {intrinsics.ppy:.3f})")
+print(f"  焦距 (Fx, Fy): ({intrinsics.fx:.3f}, {intrinsics.fy:.3f})")
+# 对于经过极线校正的 D435 红外图，畸变模型通常是 "none" 或系数为0 [citation:2][citation:4]
+print(f"  畸变模型: {intrinsics.model}")
+print(f"  畸变系数: {intrinsics.coeffs}")
+
+# 停止 pipeline
+pipeline.stop()
