@@ -1,0 +1,58 @@
+import depthai as dai
+import cv2
+
+# 创建管道
+pipeline = dai.Pipeline()
+
+# ---- 创建两个黑白相机节点 ----
+# 假设左右两个摄像头分别连接在CAM A和CAM B口
+mono_left = pipeline.create(dai.node.MonoCamera)
+mono_right = pipeline.create(dai.node.MonoCamera)
+
+# 设置传感器分辨率（例如：800万像素，根据你的OV9782调整）
+# OV9782通常支持1280x720或1280x800
+mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_800_P)
+mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_800_P)
+
+# 设置帧率
+fps = 30
+mono_left.setFps(fps)
+mono_right.setFps(fps)
+
+# **关键设置**：指定摄像头在板子上的物理连接位置
+# 根据你的实际连接情况，将左右摄像头绑定到对应的FFC接口
+mono_left.setBoardSocket(dai.CameraBoardSocket.CAM_A)   # 例如左目接CAM_A口
+mono_right.setBoardSocket(dai.CameraBoardSocket.CAM_B)  # 右目接CAM_B口
+# 第三个接口CAM_C空着不连接，没有问题
+
+# ---- 创建输出通道，用于将数据传输到主机 ----
+xout_left = pipeline.create(dai.node.XLinkOut)
+xout_right = pipeline.create(dai.node.XLinkOut)
+xout_left.setStreamName("left")
+xout_right.setStreamName("right")
+
+# 将相机节点与输出节点连接
+mono_left.out.link(xout_left.input)
+mono_right.out.link(xout_right.input)
+
+# ---- 运行管道 ----
+with dai.Device(pipeline) as device:
+    # 获取输出队列
+    q_left = device.getOutputQueue(name="left", maxSize=4, blocking=False)
+    q_right = device.getOutputQueue(name="right", maxSize=4, blocking=False)
+
+    while True:
+        # 非阻塞方式获取最新的图像帧
+        left_frame = q_left.tryGet()
+        right_frame = q_right.tryGet()
+
+        if left_frame is not None:
+            # 将帧数据转换为OpenCV格式并显示
+            cv2.imshow("Left Camera", left_frame.getCvFrame())
+
+        if right_frame is not None:
+            cv2.imshow("Right Camera", right_frame.getCvFrame())
+
+        # 按'q'键退出
+        if cv2.waitKey(1) == ord('q'):
+            break
