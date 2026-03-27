@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+多曝光图像HDR融合工具
+支持静态或手持拍摄的多曝光图像，自动对齐并融合为HDR图像。
+使用方法：
+    python hdr_fusion.py --input_dir ./images --exposures 0.001,0.002,0.004,0.008,0.016 --output result.jpg
+"""
+
+import argparse
+import cv2
+import numpy as np
+import os
+import sys
+from pathlib import Path
+
+def load_images(image_paths):
+    """加载图像，返回灰度图列表（0-255 uint8）"""
+    imgs = []
+    for path in image_paths:
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"无法读取图像: {path}")
+        imgs.append(img)
+    return imgs
+
+def align_images(images):
+    """
+    基于特征点（ORB）对齐图像，以第一张为参考。
+    返回对齐后的图像列表。
+    """
+    if len(images) < 2:
+        return images
+    print("正在进行图像对齐...")
+    ref = images[0]
+    aligned = [ref]
+    orb = cv2.ORB_create()
+    kp_ref, des_ref = orb.detectAndCompute(ref, None)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    for i in range(1, len(images)):
+        img = images[i]
+        kp, des = orb.detectAndCompute(img, None)
+        if des is None or des_ref is None:
+            print(f"警告：图像 {i} 特征点不足，跳过对齐")
+            aligned.append(img)
+            continue
+        matches = bf.match(des_ref, des)
+        matches = sorted(matches, key=lambda x: x.distance)[:50]
+        if len(matches) < 4:
+            print(f"警告：图像 {i} 匹配点不足，跳过对齐")
+            aligned.append(img)
+            continue
+        src_pts = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1,1,2)
+        dst_pts = np.float32([kp_ref[m.queryIdx].pt for m in matches]).reshape(-1,1,2)
+        H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if H is not None:
+            h, w = ref.shape
+            aligned_img = cv2.warpPerspective(img, H, (w, h))
+            aligned.append(aligned_img)
+        else:
+            aligned.append(img)
+    return aligned
+
+def fuse_debevec(images, exposures, tonemap='reinhard'):
+    """
+    使用Debevec方法融合HDR图像。
+    images: 列表，灰度图像，uint8
+    exposures: 列表，对应每张图像的曝光时间（秒）
+    tonemap: 'reinhard' 或 'mantiuk' 或 'drago'
+    返回: 8位图像，uint8
+    """
+    # 转换为float32并归一化到[0,1]
+    images_float = [img.astype(np.float32) / 255.0 for img in images]
+    # 创建Debevec融合器
+    merge = cv2.createMergeDebevec()
+    hdr = merge.process(images_float, np.array(exposures, dtype=np.float32))
+    # 色调映射
+    if tonemap == 'reinhard':
+        tonemap = cv2.createTonemapReinhard(1.5, 0, 0, 0)
+    elif tonemap == 'mantiuk':
+        tonemap = cv2.createTonemapMantiuk(2.2, 0.85, 1.2)
+    elif tonemap == 'drago':
+        tonemap = cv2.createTonemapDrago(1.0, 0.7)
+    else:
+        raise ValueError(f"不支持的色调映射: {tonemap}")
+    ldr = tonemap.process(hdr)
+    ldr = np.clip(ldr * 255, 0, 255).astype(np.uint8)
+    return ldr
+
+def fuse_weighted(images, exposures, sigma=64):
+    """
+    简单权重融合方法，适用于快速测试。
+    根据灰度值距离中间值（128）的高斯权重进行加权平均。
+    不使用相机响应函数，结果可能不如Debevec准确。
+    """
+    images_float = [img.astype(np.float32) for img in images]
+    exposures = np.array(exposures, dtype=np.float32)
+    # 计算权重
+    weights = []
+    for img in images_float:
+        w = np.exp(-((img - 128) ** 2) / (2 * sigma ** 2))
+        weights.append(w)
+    total_weight = np.sum(weights, axis=0)
+    total_weight[total_weight == 0] = 1e-6  # 避免除零
+    # 融合：辐照度 = 灰度 / 曝光时间，加权平均
+    irradiance = np.zeros_like(images_float[0])
+    for img, w, t in zip(images_float, weights, exposures):
+        irradiance += (img / t) * w
+    irradiance /= total_weight
+    # 归一化到0-255（简单的线性拉伸）
+    irradiance = (irradiance - np.min(irradiance)) / (np.max(irradiance) - np.min(irradiance))
+    ldr = (irradiance * 255).astype(np.uint8)
+    return ldr
+
+def main():
+    parser = argparse.ArgumentParser(description='多曝光图像HDR融合')
+    parser.add_argument('--input_dir', '-i', required=True, help='包含多曝光图像的目录')
+    parser.add_argument('--exposures', '-e', required=True, help='曝光时间列表，逗号分隔，单位秒，例如: 0.001,0.002,0.004,0.008,0.016')
+    parser.add_argument('--output', '-o', default='hdr_result.jpg', help='输出图像路径')
+    parser.add_argument('--method', '-m', choices=['debevec', 'weighted'], default='debevec', help='融合方法')
+    parser.add_argument('--tonemap', '-t', choices=['reinhard', 'mantiuk', 'drago'], default='reinhard', help='色调映射算法（仅对debevec有效）')
+    parser.add_argument('--align', action='store_true', help='是否对图像进行特征点对齐（适用于手持拍摄）')
+    parser.add_argument('--ext', default='.jpg', help='图像扩展名，默认.jpg')
+    args = parser.parse_args()
+
+    # 读取图像文件
+    input_path = Path(args.input_dir)
+    if not input_path.is_dir():
+        print(f"错误：目录 {args.input_dir} 不存在")
+        sys.exit(1)
+
+    # 获取所有图像文件（按文件名排序）
+    image_files = sorted(input_path.glob(f'*{args.ext}'))
+    if not image_files:
+        print(f"错误：目录 {args.input_dir} 中没有找到 *{args.ext} 文件")
+        sys.exit(1)
+
+    # 解析曝光时间
+    exposures = [float(x) for x in args.exposures.split(',')]
+    if len(image_files) != len(exposures):
+        print(f"警告：图像数量 ({len(image_files)}) 与曝光时间数量 ({len(exposures)}) 不匹配")
+        print("将使用前 min 个曝光时间，其余图像将被忽略。")
+        min_len = min(len(ima
