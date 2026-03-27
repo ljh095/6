@@ -1,0 +1,31 @@
+    # 解析曝光时间
+    exposures = [float(x) for x in args.exposures.split(',')]
+    if len(image_files) != len(exposures):
+        print(f"警告：图像数量 ({len(image_files)}) 与曝光时间数量 ({len(exposures)}) 不匹配")
+        print("将使用前 min 个曝光时间，其余图像将被忽略。")
+        min_len = min(len(image_files), len(exposures))
+        image_files = image_files[:min_len]
+        exposures = exposures[:min_len]
+
+    print(f"找到 {len(image_files)} 张图像，曝光时间: {exposures}")
+
+    # 加载图像
+    images = load_images([str(f) for f in image_files])
+
+    # 可选：对齐
+    if args.align:
+        images = align_images(images)
+
+    # 融合
+    print(f"使用 {args.method} 方法融合...")
+    if args.method == 'debevec':
+        result = fuse_debevec(images, exposures, tonemap=args.tonemap)
+    else:
+        result = fuse_weighted(images, exposures)
+
+    # 保存结果
+    cv2.imwrite(args.output, result)
+    print(f"HDR图像已保存至: {args.output}")
+
+if __name__ == '__main__':
+    main()
